@@ -1,19 +1,17 @@
-# hotel-room-checkin
-酒店客房入住登记系统，基于FastAPI开发，集成JWT权限认证 + RAG本地知识库问答
-## 功能
-- 用户登录，JWT分层权限：admin管理员 / user普通用户
-- 客房基础信息管理
-- 本地RAG知识库，支持文档检索问答，无大模型也可使用
-## 环境安装
-```bash
-pip install -r src/requirements.txt
-uvicorn src.main:app --reload
-```
-接口文档访问地址：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+# 山海旅居 - 酒店房态与入住协同管理MVP
+项目：FastAPI 后端，实现酒店房态管理、入住校验、工单、审计日志
+仓库：后端源码（包含JWT鉴权模块）
+线上演示说明：
+线上部署版本仅开放业务接口：
+GET /rooms
+GET /room/{room_id}
+PUT /room/{room_id}/status
+POST /workorder
+GET /logs
+JWT登录模块在源码中存在，本次线上演示前端采用前端本地账号校验。
 
-## 项目结构
-src/
-├── main.py      # 主程序入口
-├── auth.py      # JWT鉴权模块
-├── rag.py       # RAG知识库模块
-└── requirements.txt
+🔗 前端演示平台：https://hotel-ops-44085.app.workbuddy.host?sharecode=QUZAG42PCX
+🔗 后端接口文档Swagger：https://hotel-checkin-api.app.workbuddy.host/docs?sharecode=YIIERFJOD5
+演示账号：
+管理员 admin / admin123
+普通用户 user / user123
