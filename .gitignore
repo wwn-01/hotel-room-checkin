@@ -11,3 +11,12 @@ desktop.ini
 
 # 日志
 *.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地数据库（演示运行产生）
+*.db

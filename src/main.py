@@ -1,8 +1,20 @@
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Depends, HTTPException
 from pydantic import BaseModel
 import sqlite3
 import time
 from typing import Optional, List
+
+from . import rag as rag_mod
+from .auth import (
+    get_current_user,
+    require_admin,
+    hash_password,
+    verify_password,
+    create_access_token,
+    ROLE_ADMIN,
+    ROLE_USER,
+)
+from .rag import answer as rag_answer, get_kb
 
 app = FastAPI(title="酒店房态与入住协同MVP")
 DB_FILE = "hotel.db"
@@ -34,9 +46,14 @@ def init_db():
     CREATE TABLE IF NOT EXISTS user (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
-        role TEXT
+        role TEXT,
+        password_hash TEXT
     )
     ''')
+    # 兼容旧库：缺列时补 password_hash
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(user)").fetchall()]
+    if "password_hash" not in cols:
+        cur.execute("ALTER TABLE user ADD COLUMN password_hash TEXT")
     cur.execute('''
     CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +66,15 @@ def init_db():
     cur.execute("INSERT OR IGNORE INTO room(room_no,status,remark) VALUES ('302','清扫完成，未质检','')")
     cur.execute("INSERT OR IGNORE INTO room(room_no,status,remark) VALUES ('303','可入住','')")
     cur.execute("INSERT OR IGNORE INTO room(room_no,status,remark) VALUES ('304','维修中','水管故障')")
-    cur.execute("INSERT OR IGNORE INTO user(username,role) VALUES ('front','前台'),('qc','质检'),('admin','管理员')")
+    # 演示账号：admin/admin123（管理员）、user/user123（普通用户）
+    cur.execute(
+        "INSERT OR IGNORE INTO user(username,role,password_hash) VALUES (?,?,?)",
+        ("admin", ROLE_ADMIN, hash_password("admin123")),
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO user(username,role,password_hash) VALUES (?,?,?)",
+        ("user", ROLE_USER, hash_password("user123")),
+    )
     conn.commit()
     conn.close()
 
@@ -66,6 +91,23 @@ class WorkOrderCreate(BaseModel):
     creator: str
     result: Optional[str] = ""
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# 认证：查库校验密码，返回 JWT 所需的用户名与角色
+def authenticate_user(username: str, password: str):
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute(
+        "SELECT username, role, password_hash FROM user WHERE username=?", (username,)
+    ).fetchone()
+    conn.close()
+    if not row or not row[2] or not verify_password(password, row[2]):
+        return None
+    # 旧数据里的中文角色统一映射为英文角色
+    role = ROLE_ADMIN if row[1] in (ROLE_ADMIN, "管理员") else ROLE_USER
+    return {"username": row[0], "role": role}
+
 # 日志记录
 def add_log(operator:str, content:str):
     conn = sqlite3.connect(DB_FILE)
@@ -75,34 +117,43 @@ def add_log(operator:str, content:str):
     conn.close()
 
 # 接口
+@app.post("/login")
+def login(cred: LoginRequest):
+    """登录换取 JWT：管理员 admin/admin123，普通用户 user/user123。"""
+    user = authenticate_user(cred.username, cred.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    token = create_access_token(user["username"], user["role"])
+    return {"access_token": token, "token_type": "bearer", "role": user["role"]}
+
 @app.get("/rooms")
-def get_all_rooms():
+def get_all_rooms(role: str = Depends(get_current_user)):
     conn = sqlite3.connect(DB_FILE)
     res = conn.execute("SELECT * FROM room").fetchall()
     conn.close()
-    return {"rooms": res}
+    return {"rooms": res, "role": role}
 
 @app.get("/room/{room_id}")
-def get_room(room_id:int):
+def get_room(room_id:int, role: str = Depends(get_current_user)):
     conn = sqlite3.connect(DB_FILE)
     r = conn.execute("SELECT * FROM room WHERE id=?",(room_id,)).fetchone()
     conn.close()
     return {"room": r}
 
 @app.post("/workorder")
-def create_workorder(wo: WorkOrderCreate):
+def create_workorder(wo: WorkOrderCreate, operator: str = Depends(require_admin)):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("INSERT INTO workorder(room_id,wtype,status,creator,result) VALUES (?,?,?,?,?)",
                 (wo.room_id, wo.wtype, "新建", wo.creator, wo.result))
     conn.commit()
     wid = cur.lastrowid
-    add_log(wo.creator,f"创建工单 {wid}")
+    add_log(operator, f"管理员{operator}创建工单 {wid}（发起人 {wo.creator}）")
     conn.close()
     return {"workorder_id":wid}
 
 @app.put("/room/{room_id}/status")
-def update_room_status(room_id:int, data: RoomStatusUpdate, operator:str="admin"):
+def update_room_status(room_id:int, data: RoomStatusUpdate, operator: str = Depends(require_admin)):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("UPDATE room SET status=?,remark=? WHERE id=?",(data.status,data.remark,room_id))
@@ -112,11 +163,40 @@ def update_room_status(room_id:int, data: RoomStatusUpdate, operator:str="admin"
     return {"msg":"更新成功"}
 
 @app.get("/logs")
-def get_logs():
+def get_logs(role: str = Depends(require_admin)):
     conn = sqlite3.connect(DB_FILE)
     res = conn.execute("SELECT * FROM audit_log").fetchall()
     conn.close()
     return {"logs":res}
+
+# ---------- 知识库 / RAG / LLM Wiki ----------
+from pydantic import Field
+
+class Question(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500)
+    top_k: int = Field(default=3, ge=1, le=10)
+
+@app.get("/knowledge/reload")
+def knowledge_reload(role: str = Depends(require_admin)):
+    """重新加载知识库索引（管理员）。"""
+    kb = rag_mod.KnowledgeBase()
+    rag_mod._KB = kb
+    return {"msg": "知识库已重新加载", "chunks": len(kb.chunks)}
+
+@app.post("/rag/ask")
+def rag_ask(q: Question, role: str = Depends(get_current_user)):
+    """RAG 问答：无密钥时本地抽取式作答，答案携带来源。"""
+    return rag_answer(q.question, top_k=q.top_k)
+
+@app.post("/rag/wiki")
+def rag_wiki_endpoint(q: Question, role: str = Depends(get_current_user)):
+    """LLM Wiki：把知识片段整理成结构化词条。"""
+    return rag_mod.wiki(q.question)
+
+@app.get("/knowledge/stats")
+def knowledge_stats(role: str = Depends(get_current_user)):
+    kb = get_kb()
+    return {"chunks": len(kb.chunks), "docs_dir": str(kb.docs_dir)}
 
 if __name__ == "__main__":
     import uvicorn
