@@ -100,6 +100,43 @@ def main():
         print("[ok] 输入校验：空问题与超限 top_k 返回 422")
         ok += 1
 
+        # 9. 健康检查：无鉴权探活
+        code, health = req("/health")
+        assert code == 200 and health.get("status") == "ok", health
+        print("[ok] /health 无鉴权探活返回 200")
+        ok += 1
+
+        # 10. 房态校验闭环：可入住房间通过、未质检房间自动生成工单
+        code, yes = req("/room/2/checkin", "POST", token=ut)  # 303 可入住
+        assert code == 200 and yes["can_checkin"] is True, yes
+        code, no = req("/room/1/checkin", "POST", token=ut)   # 302 未质检
+        assert code == 200 and no["can_checkin"] is False and no["auto_workorder_id"], no
+        print("[ok] 房态校验闭环：可入住通过 / 未质检自动生成工单")
+        ok += 1
+
+        # 11. 向量检索接口
+        code, vec = req("/rag/vector-search", "POST",
+                        {"question": "房间入住条件", "top_k": 3}, token=ut)
+        assert code == 200 and vec["results"] and "similarity" in vec["results"][0], vec
+        print(f"[ok] 向量检索接口：返回 {len(vec['results'])} 个带相似度片段")
+        ok += 1
+
+        # 12. 知识图谱关联接口
+        code, graph = req("/rag/graph", "POST", {"question": "入住 质检"}, token=ut)
+        assert code == 200 and "entities" in graph, graph
+        print(f"[ok] 知识图谱接口：返回 {len(graph['entities'])} 个实体")
+        ok += 1
+
+        # 13. 文档上传：user 被拒（403），admin 成功
+        code, _ = req("/knowledge/upload", "POST",
+                      {"text": "# 测试\n内容", "source": "t.md"}, token=ut)
+        assert code == 403, f"user upload expected 403, got {code}"
+        code, up = req("/knowledge/upload", "POST",
+                       {"text": "# 测试规则\n宠物可入住需押金。", "source": "api_upload.md"}, token=at)
+        assert code == 200 and up["ok"] and up["chunks_added"] > 0, up
+        print(f"[ok] 文档上传：user 403 / admin 成功新增 {up['chunks_added']} 切片")
+        ok += 1
+
         print(f"\n全部 {ok} 项端到端检查通过")
     finally:
         proc.terminate()

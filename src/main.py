@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Body, Depends, HTTPException
 from pydantic import BaseModel
+import os
 import sqlite3
 import time
 from typing import Optional, List
@@ -169,6 +170,58 @@ def get_logs(role: str = Depends(require_admin)):
     conn.close()
     return {"logs":res}
 
+# ---------- 健康检查（公网部署探活） ----------
+@app.get("/health")
+def health():
+    """无鉴权探活接口，供部署平台/负载均衡检查服务存活性。"""
+    return {"status": "ok", "service": "hotel-room-checkin", "ts": time.time()}
+
+# ---------- 房态校验闭环（MVP 核心业务链路） ----------
+def _can_checkin(status: str):
+    """依据知识库房态规则判断能否入住，返回 (是否可入住, 判定原因)。"""
+    s = status or ""
+    if "维修" in s:
+        return False, "维修中，不可入住，需工程处理"
+    if "可入住" in s or ("清扫完成" in s and "质检通过" in s):
+        return True, "清扫完成且质检通过，可入住"
+    if "清扫完成" in s and "未质检" in s:
+        return False, "仅清扫未质检，需质检复查"
+    if "质检不通过" in s:
+        return False, "质检不通过，需重新清扫并复查"
+    return False, "房态不满足入住条件，需人工核查"
+
+@app.post("/room/{room_id}/checkin")
+def checkin_check(room_id:int, operator: str = Depends(get_current_user)):
+    """校验房态能否入住（只给建议，不自动办理入住/开锁）；不合格自动生成质检复查工单。"""
+    conn = sqlite3.connect(DB_FILE)
+    r = conn.execute("SELECT id,room_no,status,remark FROM room WHERE id=?",(room_id,)).fetchone()
+    conn.close()
+    if not r:
+        raise HTTPException(status_code=404, detail="房间不存在")
+    rid, room_no, status, remark = r
+    ok, reason = _can_checkin(status)
+    workorder_id = None
+    if not ok:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workorder(room_id,wtype,status,creator,result) VALUES (?,?,?,?,?)",
+                    (rid, "质检复查", "新建", operator, reason))
+        conn.commit()
+        workorder_id = cur.lastrowid
+        conn.close()
+        add_log(operator, f"房间{room_no}入住校验不通过（{reason}），自动生成质检复查工单 {workorder_id}")
+    else:
+        add_log(operator, f"房间{room_no}入住校验通过")
+    return {
+        "room_id": rid,
+        "room_no": room_no,
+        "raw_status": status,
+        "can_checkin": ok,
+        "reason": reason,
+        "auto_workorder_id": workorder_id,
+        "action": "仅提供建议，实际入住/开锁须人工确认",
+    }
+
 # ---------- 知识库 / RAG / LLM Wiki ----------
 from pydantic import Field
 
@@ -198,6 +251,27 @@ def knowledge_stats(role: str = Depends(get_current_user)):
     kb = get_kb()
     return {"chunks": len(kb.chunks), "docs_dir": str(kb.docs_dir)}
 
+class DocumentUpload(BaseModel):
+    text: str = Field(..., min_length=1, max_length=100000)
+    source: str = Field(default="upload.md", min_length=1, max_length=200)
+
+@app.post("/knowledge/upload")
+def knowledge_upload(doc: DocumentUpload, role: str = Depends(require_admin)):
+    """上传文档到知识库并重建向量/图谱索引（管理员）。"""
+    return rag_mod.upload_document(doc.text, doc.source)
+
+@app.post("/rag/vector-search")
+def rag_vector_search(q: Question, role: str = Depends(get_current_user)):
+    """向量检索：余弦相似度召回知识片段（登录用户）。"""
+    return {"query": q.question, "results": rag_mod.vector_search(q.question, top_k=q.top_k)}
+
+@app.post("/rag/graph")
+def rag_graph(q: Question, role: str = Depends(get_current_user)):
+    """知识图谱关联查询（登录用户）。"""
+    return {"topic": q.question, "entities": get_kb().related_entities(q.question, top_k=q.top_k)}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app",host="0.0.0.0",port=8000,reload=True)
+    # 遵循部署约定：监听 0.0.0.0，端口由 PORT 环境变量覆盖，默认 8000
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("src.main:app", host="0.0.0.0", port=port)

@@ -106,5 +106,75 @@ class TestWiki(unittest.TestCase):
         self.assertEqual(d["entries"], [])
 
 
+class TestVectorStore(unittest.TestCase):
+    def test_build_and_search(self):
+        Texts = ["房间入住需要质检通过", "宠物入住需缴纳押金", "维修中的房间不可入住"]
+        vs = rag.VectorStore()
+        vs.build(Texts)
+        hits = vs.search("宠物押金", top_k=2)
+        self.assertTrue(hits)
+        self.assertGreaterEqual(hits[0][1], 0.0)
+        self.assertLessEqual(hits[0][1], 1.0)  # 余弦相似度范围
+
+    def test_vector_search_wrapper(self):
+        kb = rag.KnowledgeBase()
+        res = kb.vector_search("房间入住条件", top_k=3)
+        self.assertTrue(res)
+        self.assertIn("similarity", res[0])
+        self.assertIn("source", res[0])
+
+
+class TestUpload(unittest.TestCase):
+    def test_add_document(self):
+        kb = rag.KnowledgeBase()
+        before = len(kb.chunks)
+        doc = "# 测试规则\n宠物可以入住，需缴纳押金 200 元，导盲犬免费。"
+        added = kb.add_document(doc, source="test_upload.md")
+        self.assertGreater(added, 0)
+        self.assertEqual(len(kb.chunks), before + added)
+        # 上传内容应可被检索到
+        hits = kb.vector_search("宠物押金", top_k=3)
+        self.assertTrue(any(h["source"] == "test_upload.md" for h in hits))
+
+    def test_upload_empty(self):
+        kb = rag.KnowledgeBase()
+        self.assertEqual(kb.add_document("   ", "empty.md"), 0)
+
+    def test_upload_document_result(self):
+        res = rag.upload_document("# 新规则\n质检由主管复核。", source="result.md")
+        self.assertTrue(res["ok"])
+        self.assertGreater(res["chunks_added"], 0)
+        self.assertIn("total_chunks", res)
+
+
+class TestExtensions(unittest.TestCase):
+    def test_llm_provider_interface(self):
+        self.assertTrue(issubclass(rag.OpenAICompatLLM, rag.LLMProvider))
+        llm = rag.OpenAICompatLLM(api_key="")  # 无密钥 -> 不可用
+        self.assertFalse(llm.available())
+        self.assertIsNone(llm.generate("q", "ctx"))
+
+    def test_kg_interface(self):
+        self.assertTrue(issubclass(rag.SimpleKnowledgeGraph, rag.KnowledgeGraph))
+        kb = rag.KnowledgeBase()
+        ents = kb.related_entities("入住 质检", top_k=3)
+        self.assertIsInstance(ents, list)
+        if ents:
+            self.assertIn("entity", ents[0])
+            self.assertIn("relations", ents[0])
+
+    def test_custom_llm_injection(self):
+        class FakeLLM(rag.LLMProvider):
+            def available(self):
+                return True
+
+            def generate(self, question, context):
+                return "这是测试 LLM 的答案"
+
+        kb = rag.KnowledgeBase(llm=FakeLLM())
+        self.assertEqual(kb.llm.name, "FakeLLM")
+        self.assertEqual(kb.llm.generate("q", "c"), "这是测试 LLM 的答案")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
